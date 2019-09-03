@@ -1,24 +1,79 @@
 #include "driver.h"
 #include "Input.tmh"
 
-_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 AmtPtpSpiInputRoutineWorker(
-	WDFDEVICE Device
+	WDFDEVICE Device,
+	WDFREQUEST PtpRequest
 )
 {
 	NTSTATUS Status;
 	PDEVICE_CONTEXT pDeviceContext;
 	WDF_OBJECT_ATTRIBUTES Attributes;
-	BOOLEAN RequestStatus;
+	BOOLEAN RequestStatus = FALSE;
 	WDFREQUEST SpiHidReadRequest;
 	WDFMEMORY SpiHidReadOutputMemory;
-
-	PAGED_CODE();
-
+	PWORKER_REQUEST_CONTEXT RequestContext;
 	pDeviceContext = DeviceGetContext(Device);
-	WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
-	Attributes.ParentObject = pDeviceContext->SpiDevice;
+
+	// This call is expected to happen after D0 entrance
+	if (pDeviceContext->DeviceStatus == D3) {
+		TraceEvents(
+			TRACE_LEVEL_WARNING,
+			TRACE_QUEUE,
+			"%!FUNC! Unexpected call while device is in D3 status"
+		);
+
+		WdfRequestComplete(PtpRequest, STATUS_DEVICE_NOT_READY);
+		return;
+	}
+
+	Status = WdfRequestForwardToIoQueue(
+		PtpRequest,
+		pDeviceContext->HidQueue
+	);
+
+	if (!NT_SUCCESS(Status)) {
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DRIVER,
+			"%!FUNC! WdfRequestForwardToIoQueue fails, status = %!STATUS!",
+			Status
+		);
+
+		WdfRequestComplete(PtpRequest, Status);
+		return;
+	}
+
+	// Late-init for the sleep workaround
+	if (pDeviceContext->DeviceStatus == D0ActiveAndUnconfigured) {
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DRIVER,
+			"%!FUNC! Re-initialize device for sleep workaround"
+		);
+
+		Status = AmtPtpSpiSetState(
+			Device,
+			TRUE
+		);
+
+		if (!NT_SUCCESS(Status))
+		{
+			TraceEvents(
+				TRACE_LEVEL_ERROR,
+				TRACE_DRIVER,
+				"%!FUNC! AmtPtpSpiSetState failed with %!STATUS!. Ignored anyway.",
+				Status
+			);
+		}
+		else {
+			pDeviceContext->DeviceStatus = D0ActiveAndConfigured;
+		}
+	}
+
+	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, WORKER_REQUEST_CONTEXT);
+	Attributes.ParentObject = Device;
 
 	Status = WdfRequestCreate(
 		&Attributes,
@@ -35,27 +90,12 @@ AmtPtpSpiInputRoutineWorker(
 			Status
 		);
 
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfRequestCreate fails, status = 0x%x \n",
-			Status
-			));
-
-		pDeviceContext->DelayedRequest = TRUE;
 		return;
 	}
 
-	WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
-	Attributes.ParentObject = SpiHidReadRequest;
-
-	Status = WdfMemoryCreate(
-		&Attributes,
-		NonPagedPoolNx,
-		PTP_POOL_TAG,
-		REPORT_BUFFER_SIZE,
-		&SpiHidReadOutputMemory,
-		NULL
+	Status = WdfMemoryCreateFromLookaside(
+		pDeviceContext->HidReadBufferLookaside,
+		&SpiHidReadOutputMemory
 	);
 
 	if (!NT_SUCCESS(Status))
@@ -63,27 +103,25 @@ AmtPtpSpiInputRoutineWorker(
 		TraceEvents(
 			TRACE_LEVEL_INFORMATION,
 			TRACE_DRIVER,
-			"%!FUNC! WdfMemoryCreate fails, status = %!STATUS!",
+			"%!FUNC! WdfMemoryCreateFromLookaside fails, status = %!STATUS!",
 			Status
 		);
 
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfMemoryCreate fails, status = 0x%x \n",
-			Status
-			));
-
-		pDeviceContext->DelayedRequest = TRUE;
+		WdfObjectDelete(SpiHidReadRequest);
 		return;
 	}
+
+	// Assign context information
+	RequestContext = WorkerRequestGetContext(SpiHidReadRequest);
+	RequestContext->DeviceContext = pDeviceContext;
+	RequestContext->RequestMemory = SpiHidReadOutputMemory;
 
 	// Invoke HID read request to the device.
 	Status = WdfIoTargetFormatRequestForInternalIoctl(
 		pDeviceContext->SpiTrackpadIoTarget,
 		SpiHidReadRequest,
 		IOCTL_HID_READ_REPORT,
-		SpiHidReadOutputMemory,
+		NULL,
 		0,
 		SpiHidReadOutputMemory,
 		0
@@ -98,21 +136,15 @@ AmtPtpSpiInputRoutineWorker(
 			Status
 		);
 
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfIoTargetFormatRequestForInternalIoctl fails, status = 0x%x \n",
-			Status
-		));
-
-		pDeviceContext->DelayedRequest = TRUE;
+		WdfObjectDelete(SpiHidReadOutputMemory);
+		WdfObjectDelete(SpiHidReadRequest);
 		return;
 	}
 
 	WdfRequestSetCompletionRoutine(
 		SpiHidReadRequest,
 		AmtPtpRequestCompletionRoutine,
-		pDeviceContext
+		RequestContext
 	);
 
 	RequestStatus = WdfRequestSend(
@@ -123,18 +155,17 @@ AmtPtpSpiInputRoutineWorker(
 
 	if (!RequestStatus)
 	{
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"AmtPtpSpiInputRoutineWorker request not sent! \n"
-		));
-	}
+		TraceEvents(
+			TRACE_LEVEL_INFORMATION,
+			TRACE_DRIVER,
+			"%!FUNC! AmtPtpSpiInputRoutineWorker request failed to sent"
+		);
 
-	pDeviceContext->PendingRequest = RequestStatus;
-	pDeviceContext->DelayedRequest = !RequestStatus;
+		WdfObjectDelete(SpiHidReadOutputMemory);
+		WdfObjectDelete(SpiHidReadRequest);
+	}
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 AmtPtpRequestCompletionRoutine(
 	WDFREQUEST SpiRequest,
@@ -144,6 +175,7 @@ AmtPtpRequestCompletionRoutine(
 )
 {
 	NTSTATUS Status;
+	PWORKER_REQUEST_CONTEXT RequestContext;
 	PDEVICE_CONTEXT pDeviceContext;
 
 	LONG SpiRequestLength;
@@ -157,55 +189,40 @@ AmtPtpRequestCompletionRoutine(
 	LONGLONG CounterDelta;
 	BOOLEAN SessionEnded = TRUE;
 
-	PAGED_CODE();
 	UNREFERENCED_PARAMETER(Target);
 
 	// Get context
-	pDeviceContext = (PDEVICE_CONTEXT) Context;
+	RequestContext = (PWORKER_REQUEST_CONTEXT) Context;
+	pDeviceContext = RequestContext->DeviceContext;
 
-	// Wait
-	KeWaitForSingleObject(
-		&pDeviceContext->PtpRequestRoutineEvent,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL
-	);
-
-	// Clear event
-	KeClearEvent(
-		&pDeviceContext->PtpRequestRoutineEvent
-	);
-
-	// Read report and fulfill PTP request (if have)
-	// Not needed to re-format the WDF request
-	// timer worker will do that
-
-	Status = WdfIoQueueRetrieveNextRequest(
-		pDeviceContext->HidIoQueue,
-		&PtpRequest
-	);
-
-	if (!NT_SUCCESS(Status))
-	{
+	// Read report and fulfill PTP request.
+	// If no report is found, just exit.
+	Status = WdfIoQueueRetrieveNextRequest(pDeviceContext->HidQueue, &PtpRequest);
+	if (!NT_SUCCESS(Status)) {
 		TraceEvents(
-			TRACE_LEVEL_INFORMATION,
+			TRACE_LEVEL_ERROR,
 			TRACE_DRIVER,
-			"%!FUNC! No pending PTP request. Routine exit"
+			"%!FUNC! WdfIoQueueRetrieveNextRequest failed with %!STATUS!",
+			Status
 		);
 
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"No pending PTP request. Routine exit \n"
-		));
-
-		pDeviceContext->DelayedRequest = TRUE;
-		goto set_event;
+		goto cleanup;
 	}
 
 	SpiRequestLength = (LONG) WdfRequestGetInformation(SpiRequest);
 	pSpiTrackpadPacket = (PSPI_TRACKPAD_PACKET) WdfMemoryGetBuffer(Params->Parameters.Ioctl.Output.Buffer, NULL);
+
+	// Safe measurement for buffer overrun
+	if (SpiRequestLength < 46) {
+		TraceEvents(
+			TRACE_LEVEL_ERROR,
+			TRACE_DRIVER,
+			"%!FUNC! Input too small: %d < 46",
+			SpiRequestLength
+		);
+		Status = STATUS_DEVICE_DATA_ERROR;
+		goto exit;
+	}
 
 	// Get Counter
 	KeQueryPerformanceCounter(
@@ -224,8 +241,10 @@ AmtPtpRequestCompletionRoutine(
 	for (UINT8 Count = 0; Count < AdjustedCount; Count++)
 	{
 		PtpReport.Contacts[Count].ContactID = Count;
-		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? (USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
-		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? (USHORT)(pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) : 0;
+		PtpReport.Contacts[Count].X = ((pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) > 0) ? 
+			(USHORT)(pSpiTrackpadPacket->Fingers[Count].X - pDeviceContext->TrackpadInfo.XMin) : 0;
+		PtpReport.Contacts[Count].Y = ((pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) > 0) ? 
+			(USHORT)(pDeviceContext->TrackpadInfo.YMax - pSpiTrackpadPacket->Fingers[Count].Y) : 0;
 		PtpReport.Contacts[Count].TipSwitch = (pSpiTrackpadPacket->Fingers[Count].Pressure > 0) ? 1 : 0;
 
 		// $S = \pi * (Touch_{Major} * Touch_{Minor}) / 4$
@@ -268,9 +287,6 @@ AmtPtpRequestCompletionRoutine(
 		PtpReport.ScanTime = (USHORT) CounterDelta;
 	}
 
-	// Done with the prev memory
-	WdfObjectDelete(SpiRequest);
-
 	Status = WdfRequestRetrieveOutputMemory(
 		PtpRequest,
 		&PtpRequestMemory
@@ -284,13 +300,6 @@ AmtPtpRequestCompletionRoutine(
 			"%!FUNC! WdfRequestRetrieveOutputBuffer failed with %!STATUS!",
 			Status
 		);
-
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfRequestRetrieveOutputBuffer failed, status = 0x%x \n",
-			Status
-			));
 
 		goto exit;
 	}
@@ -311,13 +320,6 @@ AmtPtpRequestCompletionRoutine(
 			Status
 		);
 
-		KdPrintEx((
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_INFO_LEVEL,
-			"WdfMemoryCopyFromBuffer failed, status = 0x%x \n",
-			Status
-			));
-
 		goto exit;
 	}
 
@@ -327,21 +329,15 @@ AmtPtpRequestCompletionRoutine(
 		sizeof(PTP_REPORT)
 	);
 
-	// Clear flag
-	pDeviceContext->PendingRequest = FALSE;
-
 exit:
 	WdfRequestComplete(
 		PtpRequest,
 		Status
 	);
 
-set_event:
-
-	// Set event
-	KeSetEvent(
-		&pDeviceContext->PtpRequestRoutineEvent, 
-		0, 
-		FALSE
-	);
+cleanup:
+	// Clean up
+	pSpiTrackpadPacket = NULL;
+	WdfObjectDelete(SpiRequest);
+	WdfObjectDelete(RequestContext->RequestMemory);
 }
